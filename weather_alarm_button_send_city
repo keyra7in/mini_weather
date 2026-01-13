@@ -138,7 +138,7 @@ void play_voice() {
            "    res = requests.get('http://api.openweathermap.org/data/2.5/forecast?q=%s&appid=799a82dcfc4ea4e4109e504c0b189d9e&units=metric&lang=kr', timeout=5).json()\n"
            "    f_list = res['list'][:8]\n"
            "    # 현재 기온을 curr_t 변수에 저장\n"
-           "    curr_t = round(f_list[0]['main']['temp'])\n" 
+           "    curr_t = %d\n" 
            "    max_t = round(max(item['main']['temp_max'] for item in f_list))\n"
            "    min_t = round(min(item['main']['temp_min'] for item in f_list))\n"
            "    will_rain = any('rain' in item for item in f_list)\n"
@@ -156,7 +156,7 @@ void play_voice() {
            "    os.system('mpg123 v.mp3 > /dev/null 2>&1')\n"
            "    os.remove('v.mp3')\n"
            "except Exception as e: print(f'Error: {e}')\n"
-           "\"", target_city, target_city);
+           "\"", target_city, current_weather.temp, target_city);
     system(cmd);
 }
 
