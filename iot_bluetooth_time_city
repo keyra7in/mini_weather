@@ -1,0 +1,244 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <pthread.h>
+#include <signal.h>
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/rfcomm.h>
+#include <time.h>
+
+#define BUF_SIZE 100
+#define NAME_SIZE 20
+#define ARR_CNT 5
+
+void * send_msg(void * arg);
+void * recv_msg(void * arg);
+void error_handling(char * msg);
+
+char name[NAME_SIZE]="[Default]";
+
+typedef struct {
+    int sockfd; 
+    int btfd;   
+    char sendid[NAME_SIZE];
+}DEV_FD;
+
+int main(int argc, char *argv[])
+{
+    DEV_FD dev_fd;
+    struct sockaddr_in serv_addr;
+    pthread_t snd_thread, rcv_thread;
+    void * thread_return;
+    int ret;
+    struct sockaddr_rc addr = { 0 };
+    char dest[18] = "98:D3:C1:FD:4B:B6";    //iot00
+    char msg[BUF_SIZE];
+
+    if(argc != 4) {
+        printf("Usage : %s <IP> <port> <name>\n",argv[0]);
+        exit(1);
+    }
+
+    sprintf(name, "%s",argv[3]);
+
+    dev_fd.sockfd = socket(PF_INET, SOCK_STREAM, 0);
+    if(dev_fd.sockfd == -1)
+        error_handling("socket() error");
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family=AF_INET;
+    serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
+    serv_addr.sin_port = htons(atoi(argv[2]));
+
+    if(connect(dev_fd.sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1)
+        error_handling("connect() error");
+
+    sprintf(msg,"[%s:PASSWD]",name);
+    write(dev_fd.sockfd, msg, strlen(msg));
+
+    dev_fd.btfd = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+    if(dev_fd.btfd == -1){
+        perror("socket()");
+        exit(1);
+    }
+
+    // set the connection parameters (who to connect to)
+    addr.rc_family = AF_BLUETOOTH;
+    addr.rc_channel = (uint8_t)1;
+    str2ba(dest, &addr.rc_bdaddr);
+
+    ret = connect(dev_fd.btfd, (struct sockaddr *)&addr, sizeof(addr));
+    if(ret == -1){
+        perror("bluetooth connect()");
+        exit(1);
+    }
+
+    pthread_create(&rcv_thread, NULL, recv_msg, (void *)&dev_fd);
+    pthread_create(&snd_thread, NULL, send_msg, (void *)&dev_fd);
+
+    pthread_join(snd_thread, &thread_return);
+    //  pthread_join(rcv_thread, &thread_return);
+
+    close(dev_fd.sockfd);
+    return 0;
+}
+
+void * send_msg(void * arg)  // bluetooth --> server & terminal --> bluetooth
+{
+    DEV_FD *dev_fd = (DEV_FD *)arg;
+    int ret;
+    fd_set initset, newset;
+    struct timeval tv;
+    char msg[BUF_SIZE];
+    int total = 0;
+    int timer_cnt = 0;
+
+    FD_ZERO(&initset);
+    FD_SET(dev_fd->sockfd, &initset);
+    FD_SET(dev_fd->btfd, &initset);
+    FD_SET(STDIN_FILENO, &initset); // 1. 키보드 입력을 감시 대상에 추가
+
+    char *init_time_req = "[GETTIME]\n";
+    
+    write(dev_fd->sockfd, init_time_req, strlen(init_time_req));
+    printf("Sent initial [GETTIME] request to server...\n");
+
+    //printf("Input a message! [ID]msg\n");
+
+    while(1) {
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        newset = initset;
+        
+
+        // 2. 감시하는 파일 디스크립터 중 가장 큰 값 + 1을 인자로 설정
+        int max_fd = (dev_fd->btfd > STDIN_FILENO) ? dev_fd->btfd : STDIN_FILENO;
+        if (dev_fd->sockfd > max_fd) max_fd = dev_fd->sockfd;
+
+        ret = select(max_fd + 1, &newset, NULL, NULL, &tv);
+        
+        if(ret == 0) { // 1초 동안 키보드 입력이 없을 때
+            timer_cnt++;
+
+            if (timer_cnt >= 3600){
+                char *time_req = "[GETTIME]\n";
+                write(dev_fd->sockfd, time_req, strlen(time_req)); // 서버에 시간 요청
+                timer_cnt = 0;
+            }
+        }
+        if (ret > 0) {
+            // [경로 A] 터미널에 명령어를 입력했을 때 (키보드 -> 블루투스/STM32)
+            if (FD_ISSET(STDIN_FILENO, &newset)) {
+                memset(msg, 0, BUF_SIZE);
+                if (fgets(msg, BUF_SIZE, stdin) != NULL) {
+                    // 키보드로 입력받은 명령을 블루투스(STM32)로 전달
+                    write(dev_fd->btfd, msg, strlen(msg));
+                    printf("TER -> STM: %s", msg);
+                }
+            }
+
+            // [경로 B] 블루투스(STM32)에서 데이터가 왔을 때 (블루투스 -> 서버)
+            if (FD_ISSET(dev_fd->btfd, &newset)) {
+                ret = read(dev_fd->btfd, msg + total, BUF_SIZE - total);
+                if (ret > 0) {
+                    total += ret;
+                } else if (ret == 0) {
+                    dev_fd->sockfd = -1;
+                    return NULL;
+                }
+
+                if (msg[total - 1] == '\n') {
+                    msg[total] = 0;
+                    total = 0;
+
+                        // 서버로 전송 전 로그 출력 (한 번만)
+                        printf("STM -> SRV: %s", msg);
+
+                        // 실제 전송은 딱 한 번만 수행!
+                        if (write(dev_fd->sockfd, msg, strlen(msg)) <= 0) {
+                            dev_fd->sockfd = -1;
+                            return NULL;
+                        }
+                    
+                }
+            }
+        }
+
+        if (dev_fd->sockfd == -1) return NULL;
+    }
+}
+
+void * recv_msg(void * arg)  // 서버에서 온 데이터를 블루투스로 전달
+{
+    DEV_FD *dev_fd = (DEV_FD *)arg;
+    char name_msg[NAME_SIZE + BUF_SIZE + 1];
+    int str_len;
+
+    while(1) {
+        memset(name_msg, 0x0, sizeof(name_msg));
+        str_len = read(dev_fd->sockfd, name_msg, NAME_SIZE + BUF_SIZE);
+        
+        if(str_len <= 0) {
+            dev_fd->sockfd = -1;
+            return NULL;
+        }
+        name_msg[str_len] = 0;
+
+        // [디버그용] 서버 수신 데이터 출력
+        printf("\n[SRV RECV]: %s", name_msg);
+
+        // 1. 시스템 메시지(Already, New conn)는 즉시 무시
+        if (strstr(name_msg, "Already") != NULL || strstr(name_msg, "New conn") != NULL) {
+            //printf(" -> [IGNORED] System Message\n");
+            continue; 
+        }
+
+        // 2. STM32로 데이터 전달 (핵심 로직 수정)
+        // 뭉친 데이터를 그대로 보내되, 개행 문자(\n)가 딱 하나만 있도록 보장합니다.
+        
+        // 메시지 끝에 있는 기존 개행 문자(\r, \n)들을 모두 제거하여 깨끗하게 만듭니다.
+        while (str_len > 0 && (name_msg[str_len - 1] == '\n' || name_msg[str_len - 1] == '\r')) {
+            name_msg[--str_len] = '\0';
+        }
+
+        if (str_len > 0) {
+            // 깨끗해진 메시지를 보냅니다.
+            write(dev_fd->btfd, name_msg, str_len);
+            // STM32 인터럽트 유발을 위해 딱 하나의 \n만 보냅니다.
+            write(dev_fd->btfd, "\n", 1);
+            
+            //printf(" -> [TO STM32] Forwarded (Cleaned with single \\n)\n");
+        }
+    }
+}
+
+// void send_current_time(int btfd) {
+//     time_t timer;
+//     struct tm *t;
+//     char time_msg[BUF_SIZE];
+
+//     // 1. 라즈베리 파이 시스템 시간 가져오기
+//     timer = time(NULL);
+//     t = localtime(&timer);
+
+//     // 2. STM32가 파싱하기 쉬운 형태로 포맷팅
+//     // 형식: [TIME]년@월@일@시@분@초 (년도는 뒤의 2자리만)
+//     sprintf(time_msg, "[TIME]%02d@%02d@%02d@%02d@%02d@%02d\n",
+//             t->tm_year % 100, t->tm_mon + 1, t->tm_mday,
+//             t->tm_hour, t->tm_min, t->tm_sec);
+
+//     // 3. 블루투스로 전송
+//     write(btfd, time_msg, strlen(time_msg));
+//     printf("Sent Time to STM32: %s", time_msg);
+// }
+
+void error_handling(char * msg)
+{
+    fputs(msg, stderr);
+    fputc('\n', stderr);
+    exit(1);
+}
